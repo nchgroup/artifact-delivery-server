@@ -1,0 +1,40 @@
+name: XOR Binary Encryption
+
+description: Encrypt a binary using a randomly generated XOR key
+
+inputs:
+  input:
+    description: Path to the binary to encrypt
+    required: true
+
+  output:
+    description: Path of the encrypted binary
+    required: false
+    default: encrypted.bin
+
+  key-length:
+    description: Length of the randomly generated key in bytes
+    required: false
+    default: "32"
+
+outputs:
+  key:
+    description: Generated XOR key encoded as hexadecimal
+    value: ${{ steps.encrypt.outputs.key }}
+
+  encrypted-file:
+    description: Path to the encrypted binary
+    value: ${{ steps.encrypt.outputs.encrypted-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: XOR file
+      id: encrypt
+      shell: powershell
+      env:
+        INPUT_INPUT: ${{ inputs.input }}
+        INPUT_OUTPUT: ${{ inputs.output }}
+        INPUT_KEY_LENGTH: ${{ inputs.key-length }}
+      run: |
+        node "${{ github.action_path }}/index.js"

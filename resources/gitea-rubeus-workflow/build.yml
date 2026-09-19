@@ -1,0 +1,58 @@
+name: Build Rubeus with .NET Framework
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    env:
+      GIT_TERMINAL_PROMPT: 0
+
+    steps:
+      - name: Configure Git for CI
+        shell: cmd
+        continue-on-error: true
+        run: |
+          git config --global --unset credential.helper 2>NUL
+          git config --global credential.helper ""
+          git config --global http.sslVerify false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build
+        run: msbuild Rubeus/Rubeus.csproj /p:Configuration=Release /p:Platform=AnyCPU /p:TargetFrameworkVersion=v4.8
+
+      - name: Checkout XOR Action
+        uses: actions/checkout@v4
+        with:
+          repository: admin/action-xor
+          path: ./.gitea/actions/action-xor
+          fetch-depth: 1
+
+      - name: XOR encrypt
+        id: xor
+        uses: ./.gitea/actions/action-xor
+        with:
+          input: ./Rubeus/bin/Release/Rubeus.exe
+          output: ./Rubeus.xor
+          key-length: 32
+
+      - name: Check files
+        shell: powershell
+        run: |
+          Get-ChildItem .\Rubeus.xor
+          Get-ChildItem .\Rubeus.xor.key
+
+      - name: Upload release
+        uses: akkuman/gitea-release-action@v1
+        with:
+          files: |-
+            Rubeus.xor
+            Rubeus.xor.key
