@@ -304,6 +304,12 @@ systemctl enable caddy
 systemctl start caddy
 ```
 
+Only CLI Caddy
+
+```bash
+caddy reverse-proxy --from http://vps.example.com --to 127.0.0.1:8080
+```
+
 ## TLS
 
 TLS is optional. Without TLS options, the server continues to use HTTP for compatibility.
