@@ -401,7 +401,5 @@ artifact-delivery-server
         └── Loader.ps1
 ```
 
-## License
-
 ## Author
 - cyberf
