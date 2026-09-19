@@ -252,7 +252,7 @@ Flags:
 | `502` | Error communicating with Gitea |
 | `504` | Workflow did not appear or complete before the timeout |
 
-Tested for compatibility with Gitea 1.27.
+Tested with Gitea 1.27. For a quick Gitea deployment, you can use https://github.com/nchgroup/gitea-deployer
 
 ## Caddy reverse proxy
 
