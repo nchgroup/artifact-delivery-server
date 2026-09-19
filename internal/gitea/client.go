@@ -3,26 +3,28 @@ package gitea
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
+	giteasdk "gitea.dev/sdk"
 	apperrors "github.com/nchgroup/artifact-delivery-server/internal/errors"
 )
 
 const maxGiteaJSONBytes = int64(8 * 1024 * 1024)
 
+var errGiteaResponseTooLarge = errors.New("Gitea response exceeds the configured size limit")
+
 type Client struct {
 	baseURL *url.URL
 	token   string
 	client  *http.Client
+	api     *giteasdk.Client
 }
 
 type WorkflowRun struct {
@@ -58,9 +60,8 @@ func NewClient(rawBaseURL, token string, timeout time.Duration) (*Client, error)
 	if err != nil {
 		return nil, err
 	}
-	client := &http.Client{Timeout: timeout}
-	g := &Client{baseURL: baseURL, token: token, client: client}
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+	g := &Client{baseURL: baseURL, token: token}
+	checkRedirect := func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
 			return errors.New("too many redirects")
 		}
@@ -70,152 +71,190 @@ func NewClient(rawBaseURL, token string, timeout time.Duration) (*Client, error)
 		req.Header.Set("Authorization", "token "+g.token)
 		return nil
 	}
+	g.client = &http.Client{Timeout: timeout, CheckRedirect: checkRedirect}
+	apiHTTPClient := &http.Client{
+		Timeout:       timeout,
+		CheckRedirect: checkRedirect,
+		Transport: &responseSizeTransport{
+			base:  http.DefaultTransport,
+			limit: maxGiteaJSONBytes,
+		},
+	}
+	g.api, err = giteasdk.NewClient(
+		rawBaseURL,
+		giteasdk.SetToken(token),
+		giteasdk.SetHTTPClient(apiHTTPClient),
+	)
+	if err != nil {
+		return nil, err
+	}
 	return g, nil
 }
 
-func (g *Client) apiURL(parts ...string) *url.URL {
-	segments := make([]string, 0, len(parts)+2)
-	segments = append(segments, "api", "v1")
-	for _, part := range parts {
-		segments = append(segments, escapePathSegment(part))
-	}
-	apiURL := g.baseURL.JoinPath(segments...)
-	apiURL.RawQuery = ""
-	apiURL.Fragment = ""
-	return apiURL
+type responseSizeTransport struct {
+	base  http.RoundTripper
+	limit int64
 }
 
-func escapePathSegment(segment string) string {
-	switch segment {
-	case ".":
-		return "%2E"
-	case "..":
-		return "%2E%2E"
-	default:
-		return url.PathEscape(segment)
-	}
-}
-
-func (g *Client) newAPIRequest(ctx context.Context, method string, body any, parts ...string) (*http.Request, error) {
-	var reader io.Reader
-	if body != nil {
-		encoded, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		reader = bytes.NewReader(encoded)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, g.apiURL(parts...).String(), reader)
+func (t *responseSizeTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := t.base.RoundTrip(request)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "token "+g.token)
-	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+	if response.ContentLength > t.limit {
+		_ = response.Body.Close()
+		return nil, errGiteaResponseTooLarge
 	}
-	return req, nil
+	response.Body = &limitedReadCloser{ReadCloser: response.Body, remaining: t.limit}
+	return response, nil
 }
 
-func (g *Client) doAPI(req *http.Request, expected ...int) (*http.Response, error) {
-	resp, err := g.client.Do(req)
-	if err != nil {
-		return nil, apperrors.Wrap(http.StatusBadGateway, err, "failed to reach Gitea")
-	}
-	for _, status := range expected {
-		if resp.StatusCode == status {
-			return resp, nil
+type limitedReadCloser struct {
+	io.ReadCloser
+	remaining int64
+}
+
+func (r *limitedReadCloser) Read(buffer []byte) (int, error) {
+	if r.remaining > 0 {
+		if int64(len(buffer)) > r.remaining {
+			buffer = buffer[:r.remaining]
 		}
+		read, err := r.ReadCloser.Read(buffer)
+		r.remaining -= int64(read)
+		return read, err
 	}
-	defer resp.Body.Close()
-	detail, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
-	return nil, apperrors.New(http.StatusBadGateway, "Gitea returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(detail)))
+	var probe [1]byte
+	read, err := r.ReadCloser.Read(probe[:])
+	if read > 0 {
+		return 0, errGiteaResponseTooLarge
+	}
+	return 0, err
 }
 
-func decodeJSONResponse(resp *http.Response, target any) error {
-	defer resp.Body.Close()
-	decoder := json.NewDecoder(io.LimitReader(resp.Body, maxGiteaJSONBytes+1))
-	if err := decoder.Decode(target); err != nil {
-		return apperrors.Wrap(http.StatusBadGateway, err, "Gitea returned invalid JSON")
+func apiError(response *giteasdk.Response, err error) error {
+	if err == nil {
+		return nil
 	}
-	return nil
+	if response != nil {
+		return apperrors.Wrap(http.StatusBadGateway, err, "Gitea returned status %d", response.StatusCode)
+	}
+	return apperrors.Wrap(http.StatusBadGateway, err, "failed to reach Gitea")
 }
 
-func (g *Client) TriggerWorkflowDispatch(ctx context.Context, owner, repo, workflow, ref string) error {
-	req, err := g.newAPIRequest(ctx, http.MethodPost, map[string]string{"ref": ref}, "repos", owner, repo, "actions", "workflows", workflow, "dispatches")
+func (g *Client) TriggerWorkflowDispatch(ctx context.Context, owner, repo, workflow, ref string) (int64, error) {
+	details, response, err := g.api.Actions.DispatchRepoWorkflow(
+		ctx,
+		owner,
+		repo,
+		workflow,
+		giteasdk.CreateActionsWorkflowDispatchOption{Ref: ref},
+		true,
+	)
 	if err != nil {
-		return err
+		if response != nil && (response.StatusCode == http.StatusCreated || response.StatusCode == http.StatusNoContent) {
+			return 0, nil
+		}
+		return 0, apiError(response, err)
 	}
-	resp, err := g.doAPI(req, http.StatusOK, http.StatusCreated, http.StatusNoContent)
-	if err != nil {
-		return err
+	if details == nil {
+		return 0, nil
 	}
-	resp.Body.Close()
-	return nil
+	return details.WorkflowRunID, nil
 }
 
 func (g *Client) ListWorkflowRuns(ctx context.Context, owner, repo string) ([]WorkflowRun, error) {
-	req, err := g.newAPIRequest(ctx, http.MethodGet, nil, "repos", owner, repo, "actions", "runs")
+	result, response, err := g.api.Actions.ListRepoRuns(ctx, owner, repo, giteasdk.ListRepoActionsRunsOptions{
+		ListOptions: giteasdk.ListOptions{PageSize: 50},
+	})
 	if err != nil {
-		return nil, err
+		return nil, apiError(response, err)
 	}
-	query := req.URL.Query()
-	query.Set("limit", "50")
-	req.URL.RawQuery = query.Encode()
-	resp, err := g.doAPI(req, http.StatusOK)
-	if err != nil {
-		return nil, err
+	if result == nil {
+		return nil, apperrors.New(http.StatusBadGateway, "Gitea returned an empty workflow-runs response")
 	}
-	var raw json.RawMessage
-	if err := decodeJSONResponse(resp, &raw); err != nil {
-		return nil, err
-	}
-	var wrapped struct {
-		WorkflowRuns []WorkflowRun `json:"workflow_runs"`
-	}
-	if err := json.Unmarshal(raw, &wrapped); err == nil && wrapped.WorkflowRuns != nil {
-		return wrapped.WorkflowRuns, nil
-	}
-	var runs []WorkflowRun
-	if err := json.Unmarshal(raw, &runs); err != nil {
-		return nil, apperrors.Wrap(http.StatusBadGateway, err, "Gitea returned an unexpected workflow-runs response")
+	runs := make([]WorkflowRun, 0, len(result.WorkflowRuns))
+	for _, run := range result.WorkflowRuns {
+		if run != nil {
+			runs = append(runs, workflowRunFromSDK(run))
+		}
 	}
 	return runs, nil
 }
 
 func (g *Client) GetWorkflowRun(ctx context.Context, owner, repo string, runID int64) (*WorkflowRun, error) {
-	req, err := g.newAPIRequest(ctx, http.MethodGet, nil, "repos", owner, repo, "actions", "runs", strconv.FormatInt(runID, 10))
+	run, response, err := g.api.Actions.GetRepoRun(ctx, owner, repo, runID)
 	if err != nil {
-		return nil, err
+		return nil, apiError(response, err)
 	}
-	resp, err := g.doAPI(req, http.StatusOK)
-	if err != nil {
-		return nil, err
+	if run == nil {
+		return nil, apperrors.New(http.StatusBadGateway, "Gitea returned an empty workflow-run response")
 	}
-	var run WorkflowRun
-	if err := decodeJSONResponse(resp, &run); err != nil {
-		return nil, err
-	}
-	return &run, nil
+	mapped := workflowRunFromSDK(run)
+	return &mapped, nil
 }
 
 func (g *Client) ListReleases(ctx context.Context, owner, repo string) ([]Release, error) {
-	req, err := g.newAPIRequest(ctx, http.MethodGet, nil, "repos", owner, repo, "releases")
+	result, response, err := g.api.Releases.ListReleases(ctx, owner, repo, giteasdk.ListReleasesOptions{
+		ListOptions: giteasdk.ListOptions{PageSize: 50},
+	})
 	if err != nil {
-		return nil, err
+		return nil, apiError(response, err)
 	}
-	query := req.URL.Query()
-	query.Set("limit", "50")
-	req.URL.RawQuery = query.Encode()
-	resp, err := g.doAPI(req, http.StatusOK)
-	if err != nil {
-		return nil, err
-	}
-	var releases []Release
-	if err := decodeJSONResponse(resp, &releases); err != nil {
-		return nil, err
+	releases := make([]Release, 0, len(result))
+	for _, release := range result {
+		if release != nil {
+			releases = append(releases, releaseFromSDK(release))
+		}
 	}
 	return releases, nil
+}
+
+func workflowRunFromSDK(run *giteasdk.ActionsWorkflowRun) WorkflowRun {
+	return WorkflowRun{
+		ID:          run.ID,
+		HeadSHA:     run.HeadSha,
+		HeadBranch:  run.HeadBranch,
+		Path:        run.Path,
+		Status:      run.Status,
+		Conclusion:  run.Conclusion,
+		Event:       run.Event,
+		StartedAt:   optionalTime(run.StartedAt),
+		CompletedAt: optionalTime(run.CompletedAt),
+	}
+}
+
+func releaseFromSDK(release *giteasdk.Release) Release {
+	assets := make([]Asset, 0, len(release.Attachments))
+	for _, attachment := range release.Attachments {
+		if attachment == nil {
+			continue
+		}
+		var size *int64
+		if attachment.Size > 0 {
+			value := attachment.Size
+			size = &value
+		}
+		assets = append(assets, Asset{
+			ID:                 attachment.ID,
+			Name:               attachment.Name,
+			Size:               size,
+			CreatedAt:          optionalTime(attachment.Created),
+			BrowserDownloadURL: attachment.DownloadURL,
+		})
+	}
+	return Release{
+		ID:              release.ID,
+		TagName:         release.TagName,
+		TargetCommitish: release.Target,
+		Assets:          assets,
+	}
+}
+
+func optionalTime(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	return &value
 }
 
 func (g *Client) DownloadToFile(ctx context.Context, rawURL string, expectedSize *int64, limit int64, destination *os.File) (int64, error) {

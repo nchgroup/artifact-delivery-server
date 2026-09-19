@@ -110,8 +110,18 @@ func (m *Manager) dispatchAndIdentify(ctx context.Context) (*gitea.WorkflowRun, 
 
 	triggerTime := time.Now().UTC()
 	m.logger.Info("Triggering workflow", zap.String("workflow", m.config.WorkflowName), zap.String("ref", m.config.WorkflowRef))
-	if err := m.client.TriggerWorkflowDispatch(ctx, m.config.RepositoryOwner, m.config.RepositoryName, m.config.WorkflowName, m.config.WorkflowRef); err != nil {
+	runID, err := m.client.TriggerWorkflowDispatch(ctx, m.config.RepositoryOwner, m.config.RepositoryName, m.config.WorkflowName, m.config.WorkflowRef)
+	if err != nil {
 		return nil, time.Time{}, err
+	}
+	if runID > 0 {
+		run, err := m.client.GetWorkflowRun(ctx, m.config.RepositoryOwner, m.config.RepositoryName, runID)
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+		m.claim(run.ID)
+		m.logger.Info("Workflow run identified", zap.Int64("run_id", run.ID))
+		return run, triggerTime, nil
 	}
 
 	for {

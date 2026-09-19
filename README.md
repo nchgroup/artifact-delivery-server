@@ -103,7 +103,7 @@ config:
 sequenceDiagram
     autonumber
     participant Client as Loader
-    participant Srv as Go Server
+    participant Srv as Artifact <br> Delivery Server
     participant Gitea as Gitea
     participant CI as Actions Runner
 
@@ -129,14 +129,15 @@ sequenceDiagram
 | `main.go` | Minimal executable entry point, kept at the module root for `go install ...@latest` |
 | `internal/app/run.go` | Application assembly, signal handling, and graceful shutdown |
 | `internal/config/config.go` | CLI/environment options and validation |
+| `internal/config/dotenv.go` | `.env` discovery and loading with `godotenv` |
 | `internal/errors/errors.go` | Application errors and HTTP status codes |
-| `internal/gitea/client.go` | Gitea REST client and artifact downloads |
-| `internal/workflow/manager.go` | Triggers, identifies, and waits for the workflow |
+| `internal/gitea/client.go` | Hybrid Gitea client: official `gitea.dev/sdk` for API operations and guarded HTTP streaming for artifact downloads |
+| `internal/workflow/manager.go` | Triggers workflows, identifies runs by returned ID or polling fallback, and waits for completion |
 | `internal/release/manager.go` | Correlates the release and downloads its assets |
 | `internal/pipeline/pipeline.go` | Orchestrates workflow → release → download |
 | `internal/server/server.go` | Bearer authentication and HTTP endpoint |
 | `internal/tlsconfig/tls.go` | Manual TLS, Certbot, ephemeral certificates, and native ACME |
-| `internal/logging/logger.go` | Console and file logging with Zap |
+| `internal/logging/logger.go` | Compact console and JSON or text file logging with Zap |
 
 ## Client
 
@@ -203,43 +204,59 @@ Usage: artifact-delivery-server --gitea-url=STRING --gitea-token=STRING --reposi
 Gitea artifact delivery server
 
 Flags:
-  -h, --help                                               Show context-sensitive help.
-      --env-file=STRING                                    Load configuration from this dotenv file instead of the automatic .env file; exported environment variables and command-line
-                                                           flags take precedence ($ENV_FILE).
-      --gitea-url=STRING                                   Base URL of the Gitea instance ($GITEA_URL).
-      --gitea-token=STRING                                 Gitea API token ($GITEA_TOKEN).
-      --repository-owner=STRING                            Repository owner or organization ($REPOSITORY_OWNER).
-      --repository-name=STRING                             Repository name ($REPOSITORY_NAME).
-      --workflow-name=STRING                               Workflow file name, for example build.yml ($WORKFLOW_NAME).
-      --workflow-ref="main"                                Branch or ref on which to run the workflow ($WORKFLOW_REF).
-      --server-host="0.0.0.0"                              Interface on which the server listens ($SERVER_HOST).
-      --server-port=8080                                   Port on which the server listens ($SERVER_PORT).
-      --server-path="/download"                            Path of the download endpoint ($SERVER_PATH).
-      --server-token=STRING                                Bearer token required by the download endpoint ($SERVER_TOKEN).
-      --server-header="Microsoft-IIS/10.0"                 Value returned in the HTTP Server response header ($SERVER_HEADER).
-      --decryption-key-file="decryption.key"               Release asset name of the decryption key ($DECRYPTION_KEY_FILE).
-      --encrypted-file="artifact.enc"                      Release asset name of the encrypted file ($ENCRYPTED_FILE).
-      --workflow-timeout=600                               Maximum seconds to wait for a workflow ($WORKFLOW_TIMEOUT).
-      --workflow-poll-interval=5                           Seconds between workflow status checks ($WORKFLOW_POLL_INTERVAL).
-      --gitea-request-timeout=30                           Timeout in seconds for each Gitea request ($GITEA_REQUEST_TIMEOUT).
-      --index-html-path=STRING                             Optional local index.html file to serve ($INDEX_HTML_PATH).
-      --index-html-route="/"                               Route at which the optional index.html is served ($INDEX_HTML_ROUTE).
-      --not-found-html-path=STRING                         Optional local HTML file returned for unknown routes with status 404 ($NOT_FOUND_HTML_PATH).
-      --tls-cert-file=STRING                               TLS certificate chain file. Must be used with --tls-key-file; supports Certbot fullchain.pem ($TLS_CERT_FILE).
-      --tls-key-file=STRING                                TLS private key file. Must be used with --tls-cert-file; supports Certbot privkey.pem ($TLS_KEY_FILE).
-      --auto-cert                                          Generate a new self-signed certificate at every startup; mutually exclusive with certificate files and ACME ($AUTO_CERT).
-      --auto-cert-hosts=localhost,127.0.0.1,::1,...        Comma-separated DNS names and IP addresses for auto-cert ($AUTO_CERT_HOSTS).
-      --auto-cert-output="artifact-delivery-server.crt"    File in which auto-cert writes only the public certificate; the private key remains in memory ($AUTO_CERT_OUTPUT).
-      --acme-domains=ACME-DOMAINS,...                      Comma-separated public domains for native ACME; mutually exclusive with certificate files and auto-cert ($ACME_DOMAINS).
-      --acme-email=STRING                                  Contact email for the ACME account ($ACME_EMAIL).
-      --acme-cache-dir=".artifact-delivery-server-acme"    Private cache directory for ACME certificates and account keys ($ACME_CACHE_DIR).
-      --acme-http-address=":80"                            Address for the ACME HTTP-01 challenge server; empty disables HTTP-01 ($ACME_HTTP_ADDRESS).
-      --acme-accept-tos                                    Accept the ACME certificate authority terms of service; required when --acme-domains is used ($ACME_ACCEPT_TOS).
-      --max-artifact-bytes=104857600                       Maximum encrypted artifact size in bytes ($MAX_ARTIFACT_BYTES).
-      --max-key-bytes=4096                                 Maximum decryption key size in bytes ($MAX_KEY_BYTES).
-      --log-file=STRING                                    Optional file to which logs are appended ($LOG_FILE).
-      --log-file-format="text"                             Format used in the log file. Available formats: text, json ($LOG_FILE_FORMAT).
-      --no-color                                           Disable colors in console logs. Any non-empty $NO_COLOR environment variable also disables them.
+  -h, --help                                    Show context-sensitive help.
+      --env-file=STRING                         Load configuration from this dotenv file instead of the automatic
+                                                .env file; exported environment variables and command-line flags take
+                                                precedence ($ENV_FILE).
+      --gitea-url=STRING                        Base URL of the Gitea instance ($GITEA_URL).
+      --gitea-token=STRING                      Gitea API token ($GITEA_TOKEN).
+      --repository-owner=STRING                 Repository owner or organization ($REPOSITORY_OWNER).
+      --repository-name=STRING                  Repository name ($REPOSITORY_NAME).
+      --workflow-name=STRING                    Workflow file name, for example build.yml ($WORKFLOW_NAME).
+      --workflow-ref="main"                     Branch or ref on which to run the workflow ($WORKFLOW_REF).
+      --server-host="0.0.0.0"                   Interface on which the server listens ($SERVER_HOST).
+      --server-port=8080                        Port on which the server listens ($SERVER_PORT).
+      --server-path="/download"                 Path of the download endpoint ($SERVER_PATH).
+      --server-token=STRING                     Bearer token required by the download endpoint ($SERVER_TOKEN).
+      --server-header="Microsoft-IIS/10.0"      Value returned in the HTTP Server response header ($SERVER_HEADER).
+      --decryption-key-file="decryption.key"    Release asset name of the decryption key ($DECRYPTION_KEY_FILE).
+      --encrypted-file="artifact.enc"           Release asset name of the encrypted file ($ENCRYPTED_FILE).
+      --workflow-timeout=600                    Maximum seconds to wait for a workflow ($WORKFLOW_TIMEOUT).
+      --workflow-poll-interval=5                Seconds between workflow status checks ($WORKFLOW_POLL_INTERVAL).
+      --gitea-request-timeout=30                Timeout in seconds for each Gitea request ($GITEA_REQUEST_TIMEOUT).
+      --index-html-path=STRING                  Optional local index.html file to serve ($INDEX_HTML_PATH).
+      --index-html-route="/"                    Route at which the optional index.html is served ($INDEX_HTML_ROUTE).
+      --not-found-html-path=STRING              Optional local HTML file returned for unknown routes with status 404
+                                                ($NOT_FOUND_HTML_PATH).
+      --tls-cert-file=STRING                    TLS certificate chain file. Must be used with --tls-key-file; supports
+                                                Certbot fullchain.pem ($TLS_CERT_FILE).
+      --tls-key-file=STRING                     TLS private key file. Must be used with --tls-cert-file; supports
+                                                Certbot privkey.pem ($TLS_KEY_FILE).
+      --auto-cert                               Generate a new self-signed certificate at every startup; mutually
+                                                exclusive with certificate files and ACME ($AUTO_CERT).
+      --auto-cert-hosts=localhost,127.0.0.1,::1,...
+                                                Comma-separated DNS names and IP addresses for auto-cert
+                                                ($AUTO_CERT_HOSTS).
+      --auto-cert-output="artifact-delivery-server.crt"
+                                                File in which auto-cert writes only the public certificate; the private
+                                                key remains in memory ($AUTO_CERT_OUTPUT).
+      --acme-domains=ACME-DOMAINS,...           Comma-separated public domains for native ACME; mutually exclusive with
+                                                certificate files and auto-cert ($ACME_DOMAINS).
+      --acme-email=STRING                       Contact email for the ACME account ($ACME_EMAIL).
+      --acme-cache-dir=".artifact-delivery-server-acme"
+                                                Private cache directory for ACME certificates and account keys
+                                                ($ACME_CACHE_DIR).
+      --acme-http-address=":80"                 Address for the ACME HTTP-01 challenge server; empty disables HTTP-01
+                                                ($ACME_HTTP_ADDRESS).
+      --acme-accept-tos                         Accept the ACME certificate authority terms of service; required when
+                                                --acme-domains is used ($ACME_ACCEPT_TOS).
+      --max-artifact-bytes=104857600            Maximum encrypted artifact size in bytes ($MAX_ARTIFACT_BYTES).
+      --max-key-bytes=4096                      Maximum decryption key size in bytes ($MAX_KEY_BYTES).
+      --log-file=STRING                         Optional file to which logs are appended ($LOG_FILE).
+      --log-file-format="text"                  Format used in the log file. Available formats: text, json
+                                                ($LOG_FILE_FORMAT).
+      --no-color                                Disable colors in console logs. Any non-empty $NO_COLOR environment
+                                                variable also disables them.
 ```
 
 ## HTTP status codes

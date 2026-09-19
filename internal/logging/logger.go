@@ -4,13 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"unicode"
 
 	"github.com/nchgroup/artifact-delivery-server/internal/config"
 	"go.uber.org/zap"
+	"go.uber.org/zap/buffer"
 	"go.uber.org/zap/zapcore"
 )
 
@@ -19,73 +19,118 @@ const (
 	fileTimeLayout    = "2006-01-02T15:04:05.000Z07:00"
 )
 
-type compactConsoleCore struct {
-	output     zapcore.WriteSyncer
-	level      zapcore.LevelEnabler
+var consoleBufferPool = buffer.NewPool()
+
+type compactConsoleEncoder struct {
+	zapcore.Encoder
 	color      bool
 	timeLayout string
-	fields     []zap.Field
 }
 
-func newCompactConsoleCore(output zapcore.WriteSyncer, level zapcore.LevelEnabler, color bool, timeLayout string) zapcore.Core {
-	return &compactConsoleCore{output: output, level: level, color: color, timeLayout: timeLayout}
-}
-
-func (c *compactConsoleCore) Enabled(level zapcore.Level) bool { return c.level.Enabled(level) }
-
-func (c *compactConsoleCore) With(fields []zap.Field) zapcore.Core {
-	clone := *c
-	clone.fields = append(append([]zap.Field(nil), c.fields...), fields...)
-	return &clone
-}
-
-func (c *compactConsoleCore) Check(entry zapcore.Entry, checked *zapcore.CheckedEntry) *zapcore.CheckedEntry {
-	if c.Enabled(entry.Level) {
-		return checked.AddCore(entry, c)
+func newConsoleEncoder(color bool, timeLayout string) zapcore.Encoder {
+	encoderConfig := zap.NewProductionEncoderConfig()
+	encoderConfig.TimeKey = ""
+	encoderConfig.LevelKey = ""
+	encoderConfig.NameKey = ""
+	encoderConfig.MessageKey = ""
+	encoderConfig.CallerKey = ""
+	encoderConfig.StacktraceKey = ""
+	return &compactConsoleEncoder{
+		Encoder:    zapcore.NewConsoleEncoder(encoderConfig),
+		color:      color,
+		timeLayout: timeLayout,
 	}
-	return checked
 }
 
-func (c *compactConsoleCore) Write(entry zapcore.Entry, fields []zap.Field) error {
+func (e *compactConsoleEncoder) Clone() zapcore.Encoder {
+	return &compactConsoleEncoder{
+		Encoder:    e.Encoder.Clone(),
+		color:      e.color,
+		timeLayout: e.timeLayout,
+	}
+}
+
+func (e *compactConsoleEncoder) EncodeEntry(entry zapcore.Entry, fields []zapcore.Field) (*buffer.Buffer, error) {
+	encodedFields, err := e.Encoder.EncodeEntry(entry, fields)
+	if err != nil {
+		return nil, err
+	}
+	defer encodedFields.Free()
+
 	component := entry.LoggerName
 	if component == "" {
 		component = "main"
 	}
-	var line strings.Builder
-	line.WriteString(entry.Time.Format(c.timeLayout))
-	line.WriteByte(' ')
-	line.WriteString(compactLevel(entry.Level, c.color))
-	line.WriteByte(' ')
-	line.WriteString(fmt.Sprintf("%-9s", component))
-	line.WriteByte(' ')
-	line.WriteString(safeLogMessage(entry.Message))
+	line := consoleBufferPool.Get()
+	line.AppendString(entry.Time.Format(e.timeLayout))
+	line.AppendByte(' ')
+	line.AppendString(compactLevel(entry.Level, e.color))
+	line.AppendByte(' ')
+	line.AppendString(fmt.Sprintf("%-9s", component))
+	line.AppendByte(' ')
+	line.AppendString(safeLogMessage(entry.Message))
 
-	allFields := append(append([]zap.Field(nil), c.fields...), fields...)
-	for _, field := range allFields {
-		encoded := zapcore.NewMapObjectEncoder()
-		field.AddTo(encoded)
-		keys := make([]string, 0, len(encoded.Fields))
-		for key := range encoded.Fields {
-			keys = append(keys, key)
+	if err := appendCompactFields(line, strings.TrimSpace(encodedFields.String())); err != nil {
+		line.Free()
+		return nil, err
+	}
+	line.AppendByte('\n')
+	return line, nil
+}
+
+func appendCompactFields(line *buffer.Buffer, encoded string) error {
+	if encoded == "" || encoded == "{}" {
+		return nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(encoded))
+	opening, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if opening != json.Delim('{') {
+		return fmt.Errorf("unexpected console field encoding")
+	}
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return err
 		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			value, include := compactFieldValue(encoded.Fields[key])
-			if !include {
-				continue
-			}
-			line.WriteByte(' ')
-			line.WriteString(key)
-			line.WriteByte('=')
-			line.WriteString(value)
+		key, ok := keyToken.(string)
+		if !ok {
+			return fmt.Errorf("unexpected console field key")
+		}
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return err
+		}
+		value, include, err := compactJSONValue(raw)
+		if err != nil {
+			return err
+		}
+		if include {
+			line.AppendByte(' ')
+			line.AppendString(key)
+			line.AppendByte('=')
+			line.AppendString(value)
 		}
 	}
-	line.WriteByte('\n')
-	_, err := c.output.Write([]byte(line.String()))
+	_, err = decoder.Token()
 	return err
 }
 
-func (c *compactConsoleCore) Sync() error { return c.output.Sync() }
+func compactJSONValue(raw json.RawMessage) (string, bool, error) {
+	if len(raw) > 0 && raw[0] == '"' {
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return "", false, err
+		}
+		if value == "" {
+			return "", false, nil
+		}
+		return safeLogText(value), true, nil
+	}
+	return string(raw), true, nil
+}
 
 func compactLevel(level zapcore.Level, color bool) string {
 	value := fmt.Sprintf("%-5s", strings.ToUpper(level.String()))
@@ -104,41 +149,20 @@ func compactLevel(level zapcore.Level, color bool) string {
 		code = "35"
 	}
 	return "\x1b[" + code + "m" + value + "\x1b[0m"
-}
 
-func compactFieldValue(value any) (string, bool) {
-	if text, ok := value.(string); ok {
-		if text == "" {
-			return "", false
-		}
-		return safeLogText(text), true
-	}
-	if value == nil {
-		return "null", true
-	}
-	if err, ok := value.(error); ok {
-		return safeLogText(err.Error()), true
-	}
-	encoded, err := json.Marshal(value)
-	if err == nil {
-		return string(encoded), true
-	}
-	return safeLogText(fmt.Sprint(value)), true
 }
 
 func safeLogText(value string) string {
-	if value != "" {
-		bare := true
-		for _, character := range value {
-			if unicode.IsLetter(character) || unicode.IsNumber(character) || strings.ContainsRune("._:/@+-", character) {
-				continue
-			}
-			bare = false
-			break
+	bare := value != ""
+	for _, character := range value {
+		if unicode.IsLetter(character) || unicode.IsNumber(character) || strings.ContainsRune("._:/@+-", character) {
+			continue
 		}
-		if bare {
-			return value
-		}
+		bare = false
+		break
+	}
+	if bare {
+		return value
 	}
 	return strconv.Quote(value)
 }
@@ -152,11 +176,40 @@ func safeLogMessage(value string) string {
 	}, value)
 }
 
+type singleLineCore struct {
+	zapcore.Core
+}
+
+func newConsoleCore(output zapcore.WriteSyncer, level zapcore.LevelEnabler, color bool, timeLayout string) zapcore.Core {
+	return singleLineCore{Core: zapcore.NewCore(newConsoleEncoder(color, timeLayout), output, level)}
+}
+
+func (c singleLineCore) With(fields []zapcore.Field) zapcore.Core {
+	return singleLineCore{Core: c.Core.With(fields)}
+}
+
+func (c singleLineCore) Check(entry zapcore.Entry, checked *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	if c.Enabled(entry.Level) {
+		return checked.AddCore(entry, c)
+	}
+	return checked
+}
+
+func (c singleLineCore) Write(entry zapcore.Entry, fields []zapcore.Field) error {
+	entry.Message = safeLogMessage(entry.Message)
+	return c.Core.Write(entry, fields)
+}
+
 func New(cfg *config.Config) (*zap.Logger, func(), error) {
 	level := zapcore.DebugLevel
 
 	cores := []zapcore.Core{
-		newCompactConsoleCore(zapcore.Lock(os.Stderr), level, consoleSupportsColor() && !cfg.NoColor, consoleTimeLayout),
+		newConsoleCore(
+			zapcore.Lock(os.Stderr),
+			level,
+			consoleSupportsColor() && !cfg.NoColor,
+			consoleTimeLayout,
+		),
 	}
 	var logFile *os.File
 	if cfg.LogFile != "" {
@@ -176,15 +229,19 @@ func New(cfg *config.Config) (*zap.Logger, func(), error) {
 		fileConfig.CallerKey = ""
 		fileConfig.EncodeTime = zapcore.ISO8601TimeEncoder
 		fileConfig.EncodeLevel = zapcore.LowercaseLevelEncoder
-		var encoder zapcore.Encoder
 		if cfg.LogFileFormat == "json" {
-			encoder = zapcore.NewJSONEncoder(fileConfig)
+			cores = append(cores, zapcore.NewCore(
+				zapcore.NewJSONEncoder(fileConfig),
+				zapcore.Lock(zapcore.AddSync(logFile)),
+				level,
+			))
 		} else {
-			cores = append(cores, newCompactConsoleCore(zapcore.Lock(zapcore.AddSync(logFile)), level, false, fileTimeLayout))
-			encoder = nil
-		}
-		if encoder != nil {
-			cores = append(cores, zapcore.NewCore(encoder, zapcore.Lock(zapcore.AddSync(logFile)), level))
+			cores = append(cores, newConsoleCore(
+				zapcore.Lock(zapcore.AddSync(logFile)),
+				level,
+				false,
+				fileTimeLayout,
+			))
 		}
 	}
 
