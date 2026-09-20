@@ -341,13 +341,87 @@ The standard response banner is configured separately:
 SERVER_BANNER="Microsoft-IIS/10.0"
 ```
 
-### Optional HMAC and mTLS
+### HMAC
 
 `--request-signing-key-file` optionally enables HMAC-SHA256 verification with `X-Timestamp`, `X-Nonce`, and `X-Signature`. The signed input is `METHOD`, escaped path, timestamp, and nonce joined by LF characters. A valid nonce can be used only once until the timestamp's acceptance window expires. HMAC is optional; Bearer authentication remains the required default.
 
-`--tls-client-ca-file` optionally enables mTLS and requires every client to present a certificate signed by that CA. It can be combined with manual TLS certificates, auto-cert, or ACME.
+#### Example usage:
 
-The bundled `resources/loader-psh/Loader.ps1` currently sends only the Bearer token. It does not generate HMAC headers, send configured custom client headers, or present an mTLS certificate; use a client capable of those features when enabling the optional guardrails.
+```bash
+openssl rand -out request-signing.key 32
+chmod 600 request-signing.key
+
+cat <<EOF >> env.request-signing
+REQUEST_SIGNING_KEY_FILE="./request-signing.key"
+REQUEST_SIGNING_WINDOW="60s"
+EOF
+
+./artifact-delivery-server --env-file ./env.request-signing
+```
+
+#### Client Example:
+
+```python
+import base64
+import hashlib
+import hmac
+import secrets
+import time
+from pathlib import Path
+
+import requests
+
+url = "https://host:8080/download"
+server_token = "<SERVER_TOKEN>"
+
+# It must contain exactly the same bytes as the file configured
+# on the server through REQUEST_SIGNING_KEY_FILE.
+signing_key = Path("./request-signing.key").read_bytes()
+
+method = "GET"
+path = "/download"
+timestamp = str(int(time.time()))
+nonce = secrets.token_urlsafe(24)
+
+signed_message = "\n".join([
+    method,
+    path,
+    timestamp,
+    nonce,
+])
+
+signature = base64.b64encode(
+    hmac.new(
+        signing_key,
+        signed_message.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+).decode("ascii")
+
+resp = requests.get(
+    url,
+    headers={
+        "Authorization": f"Bearer {server_token}",
+        "X-Timestamp": timestamp,
+        "X-Nonce": nonce,
+        "X-Signature": signature,
+    },
+    timeout=60,
+)
+
+resp.raise_for_status()
+decryption_key = base64.b64decode(resp.headers["Authorization"])
+encrypted_data = resp.content
+
+def xor_decrypt(data: bytes, key: bytes) -> bytes:
+    return bytes(data[i] ^ key[i % len(key)] for i in range(len(data)))
+
+binary = xor_decrypt(encrypted_data, decryption_key)
+```
+
+### mTLS
+
+`--tls-client-ca-file` optionally enables mTLS and requires every client to present a certificate signed by that CA. It can be combined with manual TLS certificates, auto-cert, or ACME.
 
 ## HTTP status codes
 
