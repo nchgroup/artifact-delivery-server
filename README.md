@@ -65,6 +65,27 @@ Basic options:
 Run "artifact-delivery-server --help-full" for the complete option reference and examples.
 ```
 
+Run `./artifact-delivery-server --help` to display a short description, the complete minimum CLI usage, descriptions of those required options, and the command for the complete help:
+
+```bash
+./artifact-delivery-server --help-full
+```
+
+The complete help includes basic and restricted examples and groups flags under:
+
+- Configuration
+- Gitea
+- Workflow and artifacts
+- HTTP server
+- Client network policy
+- Client authentication
+- Static pages
+- TLS and client certificates
+- ACME
+- Logging
+
+Configuration errors use a short usage message instead of printing the entire flag reference.
+
 ## Usage
 
 Configuration options accept flags and environment variables where an `env` name is documented. Command-line flags take precedence over environment variables.
@@ -327,30 +348,6 @@ SERVER_BANNER="Microsoft-IIS/10.0"
 `--tls-client-ca-file` optionally enables mTLS and requires every client to present a certificate signed by that CA. It can be combined with manual TLS certificates, auto-cert, or ACME.
 
 The bundled `resources/loader-psh/Loader.ps1` currently sends only the Bearer token. It does not generate HMAC headers, send configured custom client headers, or present an mTLS certificate; use a client capable of those features when enabling the optional guardrails.
-
-
-## Help
-
-Run `./artifact-delivery-server --help` to display a short description, the complete minimum CLI usage, descriptions of those required options, and the command for the complete help:
-
-```bash
-./artifact-delivery-server --help-full
-```
-
-The complete help includes basic and restricted examples and groups flags under:
-
-- Configuration
-- Gitea
-- Workflow and artifacts
-- HTTP server
-- Client network policy
-- Client authentication
-- Static pages
-- TLS and client certificates
-- ACME
-- Logging
-
-Configuration errors use a short usage message instead of printing the entire flag reference.
 
 ## HTTP status codes
 
