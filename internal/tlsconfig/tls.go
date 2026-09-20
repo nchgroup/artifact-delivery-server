@@ -48,6 +48,9 @@ func New(cfg *config.Config, logger *zap.Logger) (*Runtime, error) {
 		}
 		tlsConfig := manager.TLSConfig()
 		tlsConfig.MinVersion = tls.VersionTLS12
+		if err := configureClientCertificates(tlsConfig, cfg.TLSClientCAFile); err != nil {
+			return nil, err
+		}
 		runtime := &Runtime{Config: tlsConfig, Mode: "acme"}
 		if cfg.ACMEHTTPAddress != "" {
 			listener, err := net.Listen("tcp", cfg.ACMEHTTPAddress)
@@ -73,6 +76,9 @@ func New(cfg *config.Config, logger *zap.Logger) (*Runtime, error) {
 			return nil, err
 		}
 		base.Certificates = []tls.Certificate{certificate}
+		if err := configureClientCertificates(base, cfg.TLSClientCAFile); err != nil {
+			return nil, err
+		}
 		return &Runtime{Config: base, Mode: "auto-cert"}, nil
 	}
 	if cfg.TLSCertFile != "" {
@@ -81,9 +87,29 @@ func New(cfg *config.Config, logger *zap.Logger) (*Runtime, error) {
 			return nil, err
 		}
 		base.GetCertificate = provider.GetCertificate
+		if err := configureClientCertificates(base, cfg.TLSClientCAFile); err != nil {
+			return nil, err
+		}
 		return &Runtime{Config: base, Mode: "certificate-files"}, nil
 	}
 	return &Runtime{Mode: "http"}, nil
+}
+
+func configureClientCertificates(tlsConfig *tls.Config, caFile string) error {
+	if caFile == "" {
+		return nil
+	}
+	contents, err := os.ReadFile(caFile)
+	if err != nil {
+		return fmt.Errorf("read TLS client CA file: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(contents) {
+		return errors.New("TLS client CA file contains no valid PEM certificates")
+	}
+	tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+	tlsConfig.ClientCAs = pool
+	return nil
 }
 
 func generateSelfSignedCertificate(hosts []string) (tls.Certificate, []byte, error) {

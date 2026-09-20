@@ -1,6 +1,6 @@
 # Gitea Artifact Delivery Server
 
-Go HTTP service that, on every authenticated request to its download endpoint, triggers a Gitea Actions workflow, waits for it to finish, locates the release it produced, downloads the artifact files, and returns the encrypted binary (`ENCRYPTED_FILE`) together with the base64-encoded decryption key (`DECRYPTION_KEY_FILE`) in a single response.
+Go HTTP service that, on every authenticated request to its download endpoint, triggers a Gitea Actions workflow, waits for it to finish, locates the release it produced, downloads the artifact files, and returns the encrypted binary (`ENCRYPTED_FILE`) together with the base64-encoded decryption key (`DECRYPTION_KEY`) in a single response.
 
 This is a Proof of Concept presented at Malware Space - Ekoparty 2026: «Polymorphic Payloads with Git artifact-delivery-server.»
 
@@ -33,9 +33,41 @@ go install github.com/nchgroup/artifact-delivery-server@latest
 
 The executable is installed in `GOBIN`, or in `GOPATH/bin` when `GOBIN` is not set. Make sure that directory is included in `PATH`.
 
+## Help
+
+```text
+$ ./artifact-delivery-server --help
+Gitea artifact delivery server
+
+Basic usage:
+  artifact-delivery-server \
+    --gitea-url https://gitea.example.com \
+    --gitea-token "$GITEA_TOKEN" \
+    --repository-owner admin \
+    --repository-name repository \
+    --workflow-name build.yml \
+    --workflow-ref master \
+    --decryption-key Rubeus.xor.key \
+    --encrypted-file Rubeus.xor \
+    --server-token "$SERVER_TOKEN"
+
+Basic options:
+  --gitea-url          Base URL of the Gitea instance. Env: GITEA_URL.
+  --gitea-token        Gitea API token. Env: GITEA_TOKEN.
+  --repository-owner   Repository owner or organization. Env: REPOSITORY_OWNER.
+  --repository-name    Repository name. Env: REPOSITORY_NAME.
+  --workflow-name      Workflow file name, for example build.yml. Env: WORKFLOW_NAME.
+  --workflow-ref       Branch or ref on which to run the workflow. Env: WORKFLOW_REF.
+  --decryption-key     Release asset name of the decryption key. Env: DECRYPTION_KEY.
+  --encrypted-file     Release asset name of the encrypted file. Env: ENCRYPTED_FILE.
+  --server-token       Bearer token required by the download endpoint. Env: SERVER_TOKEN.
+
+Run "artifact-delivery-server --help-full" for the complete option reference and examples.
+```
+
 ## Usage
 
-All options accept flags and environment variables. Command-line flags take precedence over environment variables.
+Configuration options accept flags and environment variables where an `env` name is documented. Command-line flags take precedence over environment variables.
 
 ```bash
 export GITEA_URL="https://gitea.example.com"
@@ -45,7 +77,7 @@ export REPOSITORY_NAME="rubeus"
 export WORKFLOW_NAME="build.yml"
 export WORKFLOW_REF="master"
 export SERVER_TOKEN="a-long-random-token"
-export DECRYPTION_KEY_FILE="Rubeus.xor.key"
+export DECRYPTION_KEY="Rubeus.xor.key"
 export ENCRYPTED_FILE="Rubeus.xor"
 
 ./artifact-delivery-server
@@ -63,12 +95,8 @@ REPOSITORY_NAME="rubeus"
 WORKFLOW_NAME="build.yml"
 WORKFLOW_REF="master"
 SERVER_TOKEN="a-long-random-token"
-DECRYPTION_KEY_FILE="Rubeus.xor.key"
+DECRYPTION_KEY="Rubeus.xor.key"
 ENCRYPTED_FILE="Rubeus.xor"
-```
-
-```bash
-./artifact-delivery-server
 ```
 
 Use `--env-file` or `ENV_FILE` when the file has another name or location:
@@ -128,30 +156,26 @@ sequenceDiagram
 |---|---|
 | `main.go` | Minimal executable entry point, kept at the module root for `go install ...@latest` |
 | `internal/app/run.go` | Application assembly, signal handling, and graceful shutdown |
-| `internal/config/config.go` | CLI/environment options and validation |
+| `internal/config/config.go` | CLI/environment options and derived configuration |
+| `internal/config/validate.go` | Configuration validation and secret loading |
 | `internal/config/dotenv.go` | `.env` discovery and loading with `godotenv` |
+| `internal/config/headers.go` | Required client and response header parsing |
+| `internal/config/help.go` | Brief and complete help output |
 | `internal/errors/errors.go` | Application errors and HTTP status codes |
 | `internal/gitea/client.go` | Hybrid Gitea client: official `gitea.dev/sdk` for API operations and guarded HTTP streaming for artifact downloads |
 | `internal/workflow/manager.go` | Triggers workflows, identifies runs by returned ID or polling fallback, and waits for completion |
 | `internal/release/manager.go` | Correlates the release and downloads its assets |
 | `internal/pipeline/pipeline.go` | Orchestrates workflow → release → download |
-| `internal/server/server.go` | Bearer authentication and HTTP endpoint |
+| `internal/server/server.go` | HTTP endpoint, routing, and artifact delivery |
+| `internal/server/auth.go` | Bearer authentication and optional HMAC request signing |
+| `internal/server/client_ip.go` | Client address resolution and allowed-host validation |
+| `internal/server/responses.go` | Response headers and error responses |
 | `internal/tlsconfig/tls.go` | Manual TLS, Certbot, ephemeral certificates, and native ACME |
 | `internal/logging/logger.go` | Compact console and JSON or text file logging with Zap |
+| `internal/netpolicy/policy.go` | IP, CIDR, range, file, overlap merging, and trusted-proxy policies |
+| `internal/proxytrust/` | Trusted proxy presets and provider range refresh |
 
 ## Client
-
-### curl
-
-```bash
-curl --fail-with-body \
-  -H "Authorization: Bearer $SERVER_TOKEN" \
-  -D key.txt \
-  -o artifact.enc \
-  https://host:8080/download
-```
-
-### Python
 
 ```python
 import base64, requests
@@ -193,78 +217,147 @@ The custom 404 page applies to unknown routes and to unauthenticated `/download`
 
 This repo includes example default webpages: https://github.com/MichalAFerber/default-web-pages
 
-## Help
+## Access guardrails
 
-Run `./artifact-delivery-server --help` to display the usage information generated by Kong.
+IP entries supplied inline and through a file are combined. Duplicate and redundant entries are normalized automatically, including equivalent masked CIDRs, contained networks, duplicate ranges, and overlapping or adjacent ranges:
+
+```bash
+./artifact-delivery-server \
+  --allowed-client-ips "203.0.113.10,192.168.1.0/24,10.0.0.5-10" \
+  --allowed-client-ips-file ./ips.txt
+```
+
+Blank lines and full-line comments beginning with `#` are accepted in the IP file. Invalid entries stop the server during configuration validation.
+
+### Allowed host
+
+Use `--allowed-host` or `ALLOWED_HOST` to require an exact DNS hostname in the HTTP `Host` header. The comparison is case-insensitive and accepts the configured hostname with the listener port, for example `delivery.example.tld:8080`:
+
+```bash
+./artifact-delivery-server --allowed-host delivery.example.tld
+```
+
+Requests using another hostname, an IP address, or a malformed `Host` header receive the configured 404 response. This is a virtual-host restriction; it is not a replacement for DNS, firewall rules, or TLS certificate validation.
+
+Forwarding headers are ignored unless the direct peer matches `--trusted-proxies` or a trusted proxy preset:
+
+```bash
+# A reverse proxy on the same host: trusts IPv4 and IPv6 loopback.
+./artifact-delivery-server --trusted-proxy-preset localhost
+
+# Direct Cloudflare-to-origin traffic: verifies the current published edge
+# ranges before accepting CF-Connecting-IP.
+./artifact-delivery-server --trusted-proxy-preset cloudflare
+
+# AWS CloudFront origin-facing servers.
+./artifact-delivery-server --trusted-proxy-preset aws-cloudfront
+
+# Fastly public proxy ranges.
+./artifact-delivery-server --trusted-proxy-preset fastly
+
+# Caddy in a container or another known proxy network.
+./artifact-delivery-server --trusted-proxies "172.18.0.0/16,10.0.0.0/8"
+```
+
+Presets and manually supplied proxy ranges are additive. `localhost` adds `127.0.0.0/8` and `::1/128`. The other presets obtain their current ranges from the providers' official endpoints:
+
+- Cloudflare: `https://api.cloudflare.com/client/v4/ips`
+- AWS CloudFront: `https://ip-ranges.amazonaws.com/ip-ranges.json`, filtered to `CLOUDFRONT_ORIGIN_FACING`
+- Fastly: `https://api.fastly.com/public-ip-list`
+
+The selected remote presets are loaded in parallel during startup and refreshed every six hours. Startup fails closed if an initial provider response cannot be downloaded or validated. A later refresh failure keeps the last complete valid policy. Responses have a five-second request timeout and a 16 MiB size limit.
+
+Cloudflare uses `CF-Connecting-IP` only for a verified Cloudflare peer. The other presets use the trusted `X-Forwarded-For` chain. Fastly must be configured to populate or overwrite `X-Forwarded-For`, with TLS on the relevant connections.
+
+Provider IP ranges are shared by their customers and do not identify a particular account or distribution. Combine a CDN preset with a private required header, mTLS, or request signing whenever the provider supports that control.
+
+A proxy preset controls when forwarded client-IP headers are trusted; it does not block direct connections to the origin. Restrict origin access to Cloudflare or Caddy separately with a firewall, private listener, or equivalent network control when that isolation is required.
+
+### Multiple required and response headers
+
+Each flag contains one complete `Name: value` definition. Repeat the flags to require or return more than one header. The download endpoint always requires a single `Authorization: Bearer <token>` header configured through `SERVER_TOKEN`:
+
+```bash
+./artifact-delivery-server \
+  --client-header "X-Client-ID: AAAA" \
+  --client-header "X-Environment: production" \
+  --server-header "X-Content-Type-Options: nosniff" \
+  --server-header "X-Robots-Tag: noindex"
+```
+
+For environment-based configuration, place headers in files instead of encoding arrays in environment values:
+
+```dotenv
+CLIENT_HEADERS_FILE="./client-headers.txt"
+SERVER_HEADERS_FILE="./server-headers.txt"
+```
+
+`client-headers.txt`:
 
 ```text
-$ ./artifact-delivery-server --help
-Usage: artifact-delivery-server --gitea-url=STRING --gitea-token=STRING --repository-owner=STRING --repository-name=STRING --workflow-name=STRING --server-token=STRING [flags]
-
-Gitea artifact delivery server
-
-Flags:
-  -h, --help                                    Show context-sensitive help.
-      --env-file=STRING                         Load configuration from this dotenv file instead of the automatic
-                                                .env file; exported environment variables and command-line flags take
-                                                precedence ($ENV_FILE).
-      --gitea-url=STRING                        Base URL of the Gitea instance ($GITEA_URL).
-      --gitea-token=STRING                      Gitea API token ($GITEA_TOKEN).
-      --repository-owner=STRING                 Repository owner or organization ($REPOSITORY_OWNER).
-      --repository-name=STRING                  Repository name ($REPOSITORY_NAME).
-      --workflow-name=STRING                    Workflow file name, for example build.yml ($WORKFLOW_NAME).
-      --workflow-ref="main"                     Branch or ref on which to run the workflow ($WORKFLOW_REF).
-      --server-host="0.0.0.0"                   Interface on which the server listens ($SERVER_HOST).
-      --server-port=8080                        Port on which the server listens ($SERVER_PORT).
-      --server-path="/download"                 Path of the download endpoint ($SERVER_PATH).
-      --server-token=STRING                     Bearer token required by the download endpoint ($SERVER_TOKEN).
-      --server-header="Microsoft-IIS/10.0"      Value returned in the HTTP Server response header ($SERVER_HEADER).
-      --decryption-key-file="decryption.key"    Release asset name of the decryption key ($DECRYPTION_KEY_FILE).
-      --encrypted-file="artifact.enc"           Release asset name of the encrypted file ($ENCRYPTED_FILE).
-      --workflow-timeout=600                    Maximum seconds to wait for a workflow ($WORKFLOW_TIMEOUT).
-      --workflow-poll-interval=5                Seconds between workflow status checks ($WORKFLOW_POLL_INTERVAL).
-      --gitea-request-timeout=30                Timeout in seconds for each Gitea request ($GITEA_REQUEST_TIMEOUT).
-      --index-html-path=STRING                  Optional local index.html file to serve ($INDEX_HTML_PATH).
-      --index-html-route="/"                    Route at which the optional index.html is served ($INDEX_HTML_ROUTE).
-      --not-found-html-path=STRING              Optional local HTML file returned for unknown routes with status 404
-                                                ($NOT_FOUND_HTML_PATH).
-      --tls-cert-file=STRING                    TLS certificate chain file. Must be used with --tls-key-file; supports
-                                                Certbot fullchain.pem ($TLS_CERT_FILE).
-      --tls-key-file=STRING                     TLS private key file. Must be used with --tls-cert-file; supports
-                                                Certbot privkey.pem ($TLS_KEY_FILE).
-      --auto-cert                               Generate a new self-signed certificate at every startup; mutually
-                                                exclusive with certificate files and ACME ($AUTO_CERT).
-      --auto-cert-hosts=localhost,127.0.0.1,::1,...
-                                                Comma-separated DNS names and IP addresses for auto-cert
-                                                ($AUTO_CERT_HOSTS).
-      --auto-cert-output="artifact-delivery-server.crt"
-                                                File in which auto-cert writes only the public certificate; the private
-                                                key remains in memory ($AUTO_CERT_OUTPUT).
-      --acme-domains=ACME-DOMAINS,...           Comma-separated public domains for native ACME; mutually exclusive with
-                                                certificate files and auto-cert ($ACME_DOMAINS).
-      --acme-email=STRING                       Contact email for the ACME account ($ACME_EMAIL).
-      --acme-cache-dir=".artifact-delivery-server-acme"
-                                                Private cache directory for ACME certificates and account keys
-                                                ($ACME_CACHE_DIR).
-      --acme-http-address=":80"                 Address for the ACME HTTP-01 challenge server; empty disables HTTP-01
-                                                ($ACME_HTTP_ADDRESS).
-      --acme-accept-tos                         Accept the ACME certificate authority terms of service; required when
-                                                --acme-domains is used ($ACME_ACCEPT_TOS).
-      --max-artifact-bytes=104857600            Maximum encrypted artifact size in bytes ($MAX_ARTIFACT_BYTES).
-      --max-key-bytes=4096                      Maximum decryption key size in bytes ($MAX_KEY_BYTES).
-      --log-file=STRING                         Optional file to which logs are appended ($LOG_FILE).
-      --log-file-format="text"                  Format used in the log file. Available formats: text, json
-                                                ($LOG_FILE_FORMAT).
-      --no-color                                Disable colors in console logs. Any non-empty $NO_COLOR environment
-                                                variable also disables them.
+# Headers that every client request must contain.
+X-Client-ID: AAAA
+X-Environment: production
 ```
+
+`server-headers.txt`:
+
+```text
+# Headers added to every server response.
+X-Content-Type-Options: nosniff
+X-Robots-Tag: noindex
+```
+
+Inline definitions and file definitions are additive. Blank lines and full-line comments beginning with `#` are ignored. Duplicate header names, malformed definitions, empty client values, and headers managed internally (`Server`, `Authorization`, `Content-Length`, `Content-Type`, `Cache-Control`, and `Allow`) are rejected at startup. Values may contain commas and additional colons because definitions are split only on the first colon.
+
+The standard response banner is configured separately:
+
+```bash
+./artifact-delivery-server --server-banner "Microsoft-IIS/10.0"
+```
+
+```dotenv
+SERVER_BANNER="Microsoft-IIS/10.0"
+```
+
+### Optional HMAC and mTLS
+
+`--request-signing-key-file` optionally enables HMAC-SHA256 verification with `X-Timestamp`, `X-Nonce`, and `X-Signature`. The signed input is `METHOD`, escaped path, timestamp, and nonce joined by LF characters. A valid nonce can be used only once until the timestamp's acceptance window expires. HMAC is optional; Bearer authentication remains the required default.
+
+`--tls-client-ca-file` optionally enables mTLS and requires every client to present a certificate signed by that CA. It can be combined with manual TLS certificates, auto-cert, or ACME.
+
+The bundled `resources/loader-psh/Loader.ps1` currently sends only the Bearer token. It does not generate HMAC headers, send configured custom client headers, or present an mTLS certificate; use a client capable of those features when enabling the optional guardrails.
+
+
+## Help
+
+Run `./artifact-delivery-server --help` to display a short description, the complete minimum CLI usage, descriptions of those required options, and the command for the complete help:
+
+```bash
+./artifact-delivery-server --help-full
+```
+
+The complete help includes basic and restricted examples and groups flags under:
+
+- Configuration
+- Gitea
+- Workflow and artifacts
+- HTTP server
+- Client network policy
+- Client authentication
+- Static pages
+- TLS and client certificates
+- ACME
+- Logging
+
+Configuration errors use a short usage message instead of printing the entire flag reference.
 
 ## HTTP status codes
 
 | Code | Cause |
 |---|---|
 | `404` | Unknown endpoint, unauthenticated download request, or release/assets not found |
-| `405` | Method other than `GET` |
+| `405` | Authenticated request using a method other than `GET` |
 | `500` | Internal error, failed workflow, ambiguity, or artifact validation failure |
 | `502` | Error communicating with Gitea |
 | `504` | Workflow did not appear or complete before the timeout |
@@ -387,7 +480,9 @@ The domain must resolve to the server, and public ports 80 and 443 must be reach
 
 ```
 artifact-delivery-server
+├── LICENSE
 ├── README.md
+├── artifact-delivery-server
 ├── go.mod
 ├── go.sum
 ├── internal
@@ -395,18 +490,29 @@ artifact-delivery-server
 │   │   └── run.go
 │   ├── config
 │   │   ├── config.go
-│   │   └── dotenv.go
+│   │   ├── dotenv.go
+│   │   ├── headers.go
+│   │   ├── help.go
+│   │   └── validate.go
 │   ├── errors
 │   │   └── errors.go
 │   ├── gitea
 │   │   └── client.go
 │   ├── logging
 │   │   └── logger.go
+│   ├── netpolicy
+│   │   └── policy.go
 │   ├── pipeline
 │   │   └── pipeline.go
+│   ├── proxytrust
+│   │   ├── manager.go
+│   │   └── providers.go
 │   ├── release
 │   │   └── manager.go
 │   ├── server
+│   │   ├── auth.go
+│   │   ├── client_ip.go
+│   │   ├── responses.go
 │   │   └── server.go
 │   ├── tlsconfig
 │   │   └── tls.go

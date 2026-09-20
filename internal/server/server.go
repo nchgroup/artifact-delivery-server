@@ -2,21 +2,19 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
-	"encoding/json"
 	stderrors "errors"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/nchgroup/artifact-delivery-server/internal/config"
 	apperrors "github.com/nchgroup/artifact-delivery-server/internal/errors"
+	"github.com/nchgroup/artifact-delivery-server/internal/netpolicy"
 	"github.com/nchgroup/artifact-delivery-server/internal/pipeline"
 	"github.com/nchgroup/artifact-delivery-server/internal/tlsconfig"
 	"go.uber.org/zap"
@@ -25,21 +23,37 @@ import (
 const maxEncodedKeyHeaderBytes = 6000
 
 type Server struct {
-	config           *config.Config
-	logger           *zap.Logger
-	pipeline         artifactFetcher
-	server           *http.Server
-	tls              *tlsconfig.Runtime
-	notFoundContents []byte
+	config            *config.Config
+	logger            *zap.Logger
+	pipeline          artifactFetcher
+	server            *http.Server
+	tls               *tlsconfig.Runtime
+	notFoundContents  []byte
+	proxyTrust        proxyTrustProvider
+	requestSigningKey []byte
+	nonceMu           sync.Mutex
+	usedNonces        map[string]time.Time
 }
 
 type artifactFetcher interface {
 	FetchArtifactBundle(context.Context) (*pipeline.ArtifactBundle, error)
 }
 
-func New(cfg *config.Config, fetcher artifactFetcher, tlsRuntime *tlsconfig.Runtime, logger *zap.Logger) (*Server, error) {
+type proxyTrustProvider interface {
+	Policies() (*netpolicy.Policy, *netpolicy.Policy)
+}
+
+func New(cfg *config.Config, proxyTrust proxyTrustProvider, fetcher artifactFetcher, tlsRuntime *tlsconfig.Runtime, logger *zap.Logger) (*Server, error) {
 	serverLogger := logger.Named("server")
-	server := &Server{config: cfg, logger: serverLogger, pipeline: fetcher, tls: tlsRuntime}
+	server := &Server{
+		config:            cfg,
+		logger:            serverLogger,
+		pipeline:          fetcher,
+		tls:               tlsRuntime,
+		proxyTrust:        proxyTrust,
+		requestSigningKey: cfg.RequestSigningKey(),
+		usedNonces:        make(map[string]time.Time),
+	}
 	var indexContents []byte
 	if cfg.IndexHTMLPath != "" {
 		contents, err := os.ReadFile(cfg.IndexHTMLPath)
@@ -60,7 +74,11 @@ func New(cfg *config.Config, fetcher artifactFetcher, tlsRuntime *tlsconfig.Runt
 		serverLogger.Info("Custom 404 page enabled", zap.String("path", cfg.NotFoundHTMLPath))
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Server", cfg.ServerHeader)
+		setServerHeaders(w.Header(), cfg)
+		if cfg.AllowedHost != "" && !allowedHost(r.Host, cfg.AllowedHost) {
+			writeNotFound(w, server.notFoundContents)
+			return
+		}
 		switch {
 		case r.URL.Path == cfg.ServerPath:
 			server.downloadHandler(w, r)
@@ -106,8 +124,30 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) downloadHandler(w http.ResponseWriter, r *http.Request) {
-	if !authorized(r.Header.Get("Authorization"), s.config.ServerToken) {
-		s.logger.Warn("Rejected unauthenticated request", zap.String("remote", remoteHost(r.RemoteAddr)))
+	trustedProxies, cloudflareProxies := s.proxyTrust.Policies()
+	clientIP, err := resolveClientAddress(r, trustedProxies, cloudflareProxies)
+	if err != nil {
+		s.logger.Warn("Rejected request with invalid client address", zap.String("remote", remoteHost(r.RemoteAddr)), zap.Error(err))
+		writeNotFound(w, s.notFoundContents)
+		return
+	}
+	if policy := s.config.ClientIPPolicy(); policy.Enabled() && !policy.Contains(clientIP) {
+		s.logger.Warn("Rejected client outside IP allowlist", zap.String("client_ip", clientIP.String()), zap.String("remote", remoteHost(r.RemoteAddr)))
+		writeNotFound(w, s.notFoundContents)
+		return
+	}
+	if !requiredHeadersMatch(r.Header, s.config.ClientHeaderRules()) {
+		s.logger.Warn("Rejected request with invalid required headers", zap.String("client_ip", clientIP.String()))
+		writeNotFound(w, s.notFoundContents)
+		return
+	}
+	if !authorizedHeaders(r.Header, s.config.ServerToken) {
+		s.logger.Warn("Rejected unauthenticated request", zap.String("client_ip", clientIP.String()))
+		writeNotFound(w, s.notFoundContents)
+		return
+	}
+	if !s.signedRequestAuthorized(r, time.Now()) {
+		s.logger.Warn("Rejected request with invalid signature", zap.String("client_ip", clientIP.String()))
 		writeNotFound(w, s.notFoundContents)
 		return
 	}
@@ -116,11 +156,11 @@ func (s *Server) downloadHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
-	s.logger.Info("Authenticated request", zap.String("remote", remoteHost(r.RemoteAddr)))
+	s.logger.Info("Authenticated request", zap.String("client_ip", clientIP.String()), zap.String("remote", remoteHost(r.RemoteAddr)))
 	bundle, err := s.pipeline.FetchArtifactBundle(r.Context())
 	if err != nil {
 		if stderrors.Is(err, context.Canceled) {
-			s.logger.Info("Client disconnected while waiting for artifact", zap.String("remote", remoteHost(r.RemoteAddr)))
+			s.logger.Info("Client disconnected while waiting for artifact", zap.String("client_ip", clientIP.String()))
 			return
 		}
 		s.writeAppError(w, err)
@@ -135,62 +175,12 @@ func (s *Server) downloadHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Authorization", encodedKey)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(bundle.ArtifactSize, 10))
-	w.Header().Set("Cache-Control", "no-store, private, max-age=0")
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expires", "0")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	written, copyErr := io.Copy(w, bundle.ArtifactFile)
 	if copyErr != nil {
-		s.logger.Error("Failed while serving artifact", zap.Error(copyErr), zap.Int64("bytes_written", written), zap.String("remote", remoteHost(r.RemoteAddr)))
+		s.logger.Error("Failed while serving artifact", zap.Error(copyErr), zap.Int64("bytes_written", written), zap.String("client_ip", clientIP.String()))
 		return
 	}
-	s.logger.Info("Artifact served", zap.String("release", bundle.ReleaseTag), zap.Int64("bytes", written), zap.String("remote", remoteHost(r.RemoteAddr)))
-}
-
-func authorized(header, expected string) bool {
-	if !strings.HasPrefix(header, "Bearer ") {
-		return false
-	}
-	providedHash := sha256.Sum256([]byte(strings.TrimPrefix(header, "Bearer ")))
-	expectedHash := sha256.Sum256([]byte(expected))
-	return subtle.ConstantTimeCompare(providedHash[:], expectedHash[:]) == 1
-}
-
-func (s *Server) writeAppError(w http.ResponseWriter, err error) {
-	status := http.StatusInternalServerError
-	message := "Internal server error"
-	var applicationError *apperrors.Error
-	if stderrors.As(err, &applicationError) {
-		status = applicationError.Status
-		if applicationError.Message != "" {
-			message = applicationError.Message
-		}
-	}
-	s.logger.Error("Request failed", zap.Int("status", status), zap.Error(err))
-	writeJSONError(w, status, message)
-}
-
-func writeJSONError(w http.ResponseWriter, status int, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
-}
-
-func writeNotFound(w http.ResponseWriter, contents []byte) {
-	if contents == nil {
-		writeJSONError(w, http.StatusNotFound, "Not found")
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Content-Length", strconv.Itoa(len(contents)))
-	w.WriteHeader(http.StatusNotFound)
-	_, _ = w.Write(contents)
-}
-
-func remoteHost(address string) string {
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		return address
-	}
-	return host
+	s.logger.Info("Artifact served", zap.String("release", bundle.ReleaseTag), zap.Int64("bytes", written), zap.String("client_ip", clientIP.String()))
 }

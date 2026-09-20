@@ -28,16 +28,13 @@ type Client struct {
 }
 
 type WorkflowRun struct {
-	ID          int64      `json:"id"`
-	HeadSHA     string     `json:"head_sha"`
-	HeadBranch  string     `json:"head_branch"`
-	Path        string     `json:"path"`
-	Status      string     `json:"status"`
-	Conclusion  string     `json:"conclusion"`
-	Event       string     `json:"event"`
-	CreatedAt   *time.Time `json:"created_at"`
-	StartedAt   *time.Time `json:"started_at"`
-	CompletedAt *time.Time `json:"completed_at"`
+	ID         int64  `json:"id"`
+	HeadSHA    string `json:"head_sha"`
+	HeadBranch string `json:"head_branch"`
+	Path       string `json:"path"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+	Event      string `json:"event"`
 }
 
 type Release struct {
@@ -211,15 +208,13 @@ func (g *Client) ListReleases(ctx context.Context, owner, repo string) ([]Releas
 
 func workflowRunFromSDK(run *giteasdk.ActionsWorkflowRun) WorkflowRun {
 	return WorkflowRun{
-		ID:          run.ID,
-		HeadSHA:     run.HeadSha,
-		HeadBranch:  run.HeadBranch,
-		Path:        run.Path,
-		Status:      run.Status,
-		Conclusion:  run.Conclusion,
-		Event:       run.Event,
-		StartedAt:   optionalTime(run.StartedAt),
-		CompletedAt: optionalTime(run.CompletedAt),
+		ID:         run.ID,
+		HeadSHA:    run.HeadSha,
+		HeadBranch: run.HeadBranch,
+		Path:       run.Path,
+		Status:     run.Status,
+		Conclusion: run.Conclusion,
+		Event:      run.Event,
 	}
 }
 

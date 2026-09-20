@@ -6,3 +6,5 @@ artifact-delivery-server.crt
 .env.*
 !.env.example
 .DS_Store
+404.html
+index.html

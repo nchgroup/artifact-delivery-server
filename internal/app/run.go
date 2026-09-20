@@ -14,6 +14,7 @@ import (
 	"github.com/nchgroup/artifact-delivery-server/internal/gitea"
 	"github.com/nchgroup/artifact-delivery-server/internal/logging"
 	"github.com/nchgroup/artifact-delivery-server/internal/pipeline"
+	"github.com/nchgroup/artifact-delivery-server/internal/proxytrust"
 	"github.com/nchgroup/artifact-delivery-server/internal/server"
 	"github.com/nchgroup/artifact-delivery-server/internal/tlsconfig"
 	"go.uber.org/zap"
@@ -30,6 +31,16 @@ func Run(args []string) error {
 	}
 	defer cleanupLogger()
 	mainLogger := logger.Named("main")
+	stopContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	proxyTrust, err := proxytrust.New(stopContext, cfg.TrustedProxies, cfg.TrustedProxyPresets)
+	if err != nil {
+		return fmt.Errorf("initialize trusted proxy presets: %w", err)
+	}
+	if proxyTrust.HasRemotePresets() {
+		go proxyTrust.Run(stopContext, logger.Named("proxy-trust"))
+	}
 
 	mainLogger.Info("Starting Gitea artifact delivery server",
 		zap.String("repository", cfg.RepositoryOwner+"/"+cfg.RepositoryName),
@@ -45,13 +56,11 @@ func Run(args []string) error {
 		return fmt.Errorf("initialize TLS: %w", err)
 	}
 	deliveryPipeline := pipeline.New(client, cfg, logger)
-	httpServer, err := server.New(cfg, deliveryPipeline, tlsRuntime, logger)
+	httpServer, err := server.New(cfg, proxyTrust, deliveryPipeline, tlsRuntime, logger)
 	if err != nil {
 		return fmt.Errorf("initialize HTTP server: %w", err)
 	}
 
-	stopContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	serverErrors := make(chan error, 1)
 	go func() { serverErrors <- httpServer.Run() }()
 

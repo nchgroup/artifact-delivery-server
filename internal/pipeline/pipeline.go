@@ -3,7 +3,6 @@ package pipeline
 import (
 	"context"
 	"os"
-	"time"
 
 	"github.com/nchgroup/artifact-delivery-server/internal/config"
 	"github.com/nchgroup/artifact-delivery-server/internal/gitea"
@@ -17,7 +16,6 @@ type ArtifactBundle struct {
 	ArtifactFile  *os.File
 	ArtifactSize  int64
 	ReleaseTag    string
-	FetchedAt     time.Time
 }
 
 func (b *ArtifactBundle) Close() {
@@ -55,10 +53,12 @@ func (p *Pipeline) FetchArtifactBundle(ctx context.Context) (*ArtifactBundle, er
 	p.logger.Debug("Required assets found", zap.String("key_asset", keyAsset.Name), zap.String("encrypted_asset", encryptedAsset.Name))
 	key, err := p.release.DownloadKey(ctx, keyAsset)
 	if err != nil {
+		p.release.ReleaseClaim(release, keyAsset, encryptedAsset)
 		return nil, err
 	}
 	artifact, size, err := p.release.DownloadArtifact(ctx, encryptedAsset)
 	if err != nil {
+		p.release.ReleaseClaim(release, keyAsset, encryptedAsset)
 		return nil, err
 	}
 	return &ArtifactBundle{
@@ -66,6 +66,5 @@ func (p *Pipeline) FetchArtifactBundle(ctx context.Context) (*ArtifactBundle, er
 		ArtifactFile:  artifact,
 		ArtifactSize:  size,
 		ReleaseTag:    release.TagName,
-		FetchedAt:     time.Now().UTC(),
 	}, nil
 }

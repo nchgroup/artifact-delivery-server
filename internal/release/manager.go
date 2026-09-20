@@ -78,7 +78,7 @@ func (m *Manager) FindForRun(ctx context.Context, run *workflow.CompletedRun) (*
 		if !commitMatches && !refMatches {
 			continue
 		}
-		claimKey := fmt.Sprintf("%d:%d:%d:%d", release.ID, keyAsset.ID, encAsset.ID, assetTime.UnixNano())
+		claimKey := releaseClaimKey(&release, keyAsset, encAsset)
 		if m.isClaimed(claimKey) {
 			continue
 		}
@@ -96,6 +96,24 @@ func (m *Manager) FindForRun(ctx context.Context, run *workflow.CompletedRun) (*
 	}
 	m.logger.Info("Release selected", zap.Int64("run_id", run.ID), zap.Int64("release_id", selected.release.ID), zap.String("tag", selected.release.TagName))
 	return &selected.release, &selected.keyAsset, &selected.encAsset, nil
+}
+
+func (m *Manager) ReleaseClaim(release *gitea.Release, keyAsset, encryptedAsset *gitea.Asset) {
+	if release == nil || keyAsset == nil || encryptedAsset == nil || keyAsset.CreatedAt == nil || encryptedAsset.CreatedAt == nil {
+		return
+	}
+	claimKey := releaseClaimKey(release, keyAsset, encryptedAsset)
+	m.claimMu.Lock()
+	delete(m.claimed, claimKey)
+	m.claimMu.Unlock()
+}
+
+func releaseClaimKey(release *gitea.Release, keyAsset, encryptedAsset *gitea.Asset) string {
+	assetTime := *keyAsset.CreatedAt
+	if encryptedAsset.CreatedAt.After(assetTime) {
+		assetTime = *encryptedAsset.CreatedAt
+	}
+	return fmt.Sprintf("%d:%d:%d:%d", release.ID, keyAsset.ID, encryptedAsset.ID, assetTime.UnixNano())
 }
 
 func (m *Manager) DownloadKey(ctx context.Context, asset *gitea.Asset) ([]byte, error) {
