@@ -171,31 +171,6 @@ sequenceDiagram
     Client->>Client: Decrypt binary
 ```
 
-## Modules
-
-| File | Responsibility |
-|---|---|
-| `main.go` | Minimal executable entry point, kept at the module root for `go install ...@latest` |
-| `internal/app/run.go` | Application assembly, signal handling, and graceful shutdown |
-| `internal/config/config.go` | CLI/environment options and derived configuration |
-| `internal/config/validate.go` | Configuration validation and secret loading |
-| `internal/config/dotenv.go` | `.env` discovery and loading with `godotenv` |
-| `internal/config/headers.go` | Required client and response header parsing |
-| `internal/config/help.go` | Brief and complete help output |
-| `internal/errors/errors.go` | Application errors and HTTP status codes |
-| `internal/gitea/client.go` | Hybrid Gitea client: official `gitea.dev/sdk` for API operations and guarded HTTP streaming for artifact downloads |
-| `internal/workflow/manager.go` | Triggers workflows, identifies runs by returned ID or polling fallback, and waits for completion |
-| `internal/release/manager.go` | Correlates the release and downloads its assets |
-| `internal/pipeline/pipeline.go` | Orchestrates workflow → release → download |
-| `internal/server/server.go` | HTTP endpoint, routing, and artifact delivery |
-| `internal/server/auth.go` | Bearer authentication and optional HMAC request signing |
-| `internal/server/client_ip.go` | Client address resolution and allowed-host validation |
-| `internal/server/responses.go` | Response headers and error responses |
-| `internal/tlsconfig/tls.go` | Manual TLS, Certbot, ephemeral certificates, and native ACME |
-| `internal/logging/logger.go` | Compact console and JSON or text file logging with Zap |
-| `internal/netpolicy/policy.go` | IP, CIDR, range, file, overlap merging, and trusted-proxy policies |
-| `internal/proxytrust/` | Trusted proxy presets and provider range refresh |
-
 ## Client
 
 ```python
@@ -546,60 +521,6 @@ sudo ./artifact-delivery-server \
 ```
 
 The domain must resolve to the server, and public ports 80 and 443 must be reachable. Unlike `auto-cert`, ACME must retain its private cache to renew the certificate and account; the directory is protected with mode `0700`.
-
-## Project structure
-
-```
-artifact-delivery-server
-├── LICENSE
-├── README.md
-├── artifact-delivery-server
-├── go.mod
-├── go.sum
-├── internal
-│   ├── app
-│   │   └── run.go
-│   ├── config
-│   │   ├── config.go
-│   │   ├── dotenv.go
-│   │   ├── headers.go
-│   │   ├── help.go
-│   │   └── validate.go
-│   ├── errors
-│   │   └── errors.go
-│   ├── gitea
-│   │   └── client.go
-│   ├── logging
-│   │   └── logger.go
-│   ├── netpolicy
-│   │   └── policy.go
-│   ├── pipeline
-│   │   └── pipeline.go
-│   ├── proxytrust
-│   │   ├── manager.go
-│   │   └── providers.go
-│   ├── release
-│   │   └── manager.go
-│   ├── server
-│   │   ├── auth.go
-│   │   ├── client_ip.go
-│   │   ├── responses.go
-│   │   └── server.go
-│   ├── tlsconfig
-│   │   └── tls.go
-│   └── workflow
-│       └── manager.go
-├── main.go
-└── resources
-    ├── gitea-action-xor
-    │   ├── README.md
-    │   ├── action.yml
-    │   └── index.js
-    ├── gitea-rubeus-workflow
-    │   └── build.yml
-    └── loader-psh
-        └── Loader.ps1
-```
 
 ## Author
 - cyberf
